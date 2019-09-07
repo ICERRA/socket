@@ -20,9 +20,8 @@ type conn struct {
 
 	opts options
 
-	recvMsg  chan []byte
-	shareMsg chan Message
-	sendMsg  chan Message
+	recvMsg chan []byte
+	sendMsg chan Message
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -139,6 +138,7 @@ func (c *conn) readLoop() error {
 
 			select {
 			case c.recvMsg <- data[0:n]:
+				data = data[:0]
 			default:
 				log.Println("recv chan blocked")
 			}
