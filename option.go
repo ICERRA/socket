@@ -1,15 +1,18 @@
 package socket
 
-import "net"
+import (
+	"time"
+)
 
 type options struct {
 	codec Codec
 
-	onConnect func(net.Conn) error
-	onMessage func(Message)
-	onError   func(error) // 只要网络出错， 或者encode decode 出错， 都会收到该通知
+	onMessage func(message Message) error
+	onError   func(error) bool // 出错的时候, 是否断开连接, 由调用方自由定制
 
-	bufferSize int // size of buffered channel
+	bufferSize    int // size of buffered channel
+	maxReadLength int
+	heartbeat     time.Duration
 }
 
 // Option sets server options.
@@ -22,34 +25,42 @@ func CustomCodecOption(codec Codec) Option {
 	}
 }
 
-// BufferSizeOption returns a Option that is the size of buffered channel,
-// for example an indicator of BufferSize32 means a size of 256.
+// HeartbeatOption returns a Option that is the size of buffered channel,
+// for example an indicator of defaultBufferSize32 means a size of 256.
 func BufferSizeOption(indicator int) Option {
 	return func(o *options) {
 		o.bufferSize = indicator
 	}
 }
 
-// OnConnectOption returns a Option that will set callback to call when new
-// client connected.
-func OnConnectOption(cb func(net.Conn) error) Option {
+// HeartbeatOption returns a Option that is the size of buffered channel,
+// for example an indicator of defaultBufferSize32 means a size of 256.
+func HeartbeatOption(heartbeat time.Duration) Option {
 	return func(o *options) {
-		o.onConnect = cb
+		o.heartbeat = heartbeat
 	}
 }
 
-// OnMessageOption returns a Option that will set callback to call when new
-// message arrived.
-func OnMessageOption(cb func(Message)) Option {
+// MessageMaxSize returns a Option that will set buffer to receive message when new
+// []byte arrived.
+func MessageMaxSize(size int) Option {
 	return func(o *options) {
-		o.onMessage = cb
+		o.maxReadLength = size
 	}
 }
 
 // OnErrorOption returns a Option that will set callback to call when error
 // occurs.
-func OnErrorOption(cb func(error)) Option {
+func OnErrorOption(cb func(error) bool) Option {
 	return func(o *options) {
 		o.onError = cb
+	}
+}
+
+// OnMessageOption returns a Option that will set callback to call when new
+// message arrived.
+func OnMessageOption(cb func(Message) error) Option {
+	return func(o *options) {
+		o.onMessage = cb
 	}
 }

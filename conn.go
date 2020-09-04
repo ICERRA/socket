@@ -1,193 +1,198 @@
 package socket
 
 import (
-	"bufio"
-	"bytes"
 	"context"
+	"net"
+	"time"
+
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
-	"log"
-	"net"
 )
 
-// conn represents a client connection to a TCP server.
-type conn struct {
-	connID int64
-	addr   string
+var (
+	ErrInvalidCodec     = errors.New("invalid codec callback")
+	ErrInvalidOnMessage = errors.New("invalid on message callback")
+)
 
+// Conn represents a client connection to a TCP server.
+type Conn struct {
 	rawConn net.Conn
-	reader  *bufio.Reader
 
 	opts options
 
-	recvMsg chan []byte
-	sendMsg chan Message
-
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	err   error
-	group *errgroup.Group
+	heartbeat time.Duration
+	sendMsg   chan []byte
 }
 
-const BufferSize32 = 32
+const (
+	defaultBufferSize32     = 32
+	defaultMaxPackageLength = 1024 * 1024
+)
 
 // NewConn returns a new client connection which has not started to
 // serve requests yet.
-func NewConn(connID int64, conn net.Conn, opt ...Option) *conn {
+func NewConn(conn net.Conn, opt ...Option) (*Conn, error) {
 	var opts options
 	for _, o := range opt {
 		o(&opts)
 	}
 
-	if opts.bufferSize <= 0 {
-		opts.bufferSize = BufferSize32
+	err := checkOptions(&opts)
+	if err != nil {
+		return nil, err
 	}
 
-	return newClientConnWithOptions(connID, conn, opts)
+	return newClientConnWithOptions(conn, opts), nil
 }
 
-func newClientConnWithOptions(connID int64, c net.Conn, opts options) *conn {
-	parentCtx, cancel := context.WithCancel(context.Background())
-	group, ctx := errgroup.WithContext(parentCtx)
+func checkOptions(opts *options) error {
+	if opts.bufferSize <= 0 {
+		opts.bufferSize = defaultBufferSize32
+	}
 
-	cc := &conn{
-		connID: connID,
-		addr:   c.RemoteAddr().String(),
+	if opts.maxReadLength <= 0 {
+		opts.maxReadLength = defaultMaxPackageLength
+	}
 
-		rawConn: c,
-		reader:  bufio.NewReader(c),
+	if opts.onMessage == nil {
+		return ErrInvalidOnMessage
+	}
 
-		opts: opts,
+	if opts.heartbeat <= 0 {
+		opts.heartbeat = time.Second * 30
+	}
 
-		recvMsg: make(chan []byte, opts.bufferSize),
-		sendMsg: make(chan Message, opts.bufferSize),
+	if opts.codec == nil {
+		return ErrInvalidCodec
+	}
 
-		ctx:    ctx,
-		cancel: cancel,
-		group:  group,
+	return nil
+}
+
+func newClientConnWithOptions(c net.Conn, opts options) *Conn {
+	cc := &Conn{
+		rawConn:   c,
+		opts:      opts,
+		heartbeat: opts.heartbeat,
+		sendMsg:   make(chan []byte, opts.bufferSize),
 	}
 
 	return cc
 }
 
-// ConnID returns the net ID of client connection.
-func (c *conn) ConnID() int64 {
-	return c.connID
-}
+// Run run the connection, creating two go-routines
+// for reading and writing.
+func (c *Conn) Run(ctx context.Context) error {
+	group, child := errgroup.WithContext(ctx)
 
-// Start starts the client connection, creating go-routines for reading,
-// writing and handlng.
-func (c *conn) Start() {
-	if c.opts.onConnect != nil {
-		if err := c.opts.onConnect(c.rawConn); err != nil {
-			return
-		}
+	// Read Loop
+	group.Go(func() error {
+		return c.readLoop(child)
+	})
+
+	// Write Loop
+	group.Go(func() error {
+		return c.writeLoop(child)
+	})
+
+	// Wait err and break
+	if err := group.Wait(); err != nil {
+		c.close()
+		return err
 	}
 
-	c.group.Go(c.readLoop)
-	c.group.Go(c.writeLoop)
-	c.group.Go(c.handleLoop)
-
-	if err := c.group.Wait(); err != nil {
-		c.err = err
-		c.cancel()
-		c.rawConn.Close()
-	}
+	return nil
 }
 
-// Write writes a message to the client.
-func (c *conn) Write(message Message) error {
+// Write write []byte to the Conn.
+func (c *Conn) Write(message Message) error {
+	bytes, err := c.opts.codec.Encode(message)
+	if err != nil {
+		return err
+	}
+
 	select {
-	case <-c.ctx.Done():
-		return errors.New("tcp closed")
-	case c.sendMsg <- message:
+	case c.sendMsg <- bytes:
 		return nil
 	default:
 		return errors.New("chan blocked")
 	}
 }
 
-// RemoteAddr returns the remote address of server connection.
-func (c *conn) RemoteAddr() net.Addr {
+func (c *Conn) Addr() net.Addr {
 	return c.rawConn.RemoteAddr()
 }
 
-// LocalAddr returns the local address of server connection.
-func (c *conn) LocalAddr() net.Addr {
-	return c.rawConn.LocalAddr()
+func (c *Conn) read(data []byte) (int, error) {
+	c.rawConn.SetReadDeadline(time.Now().Add(c.heartbeat * 2))
+
+	n, err := c.rawConn.Read(data)
+
+	// 如果错误处理方, 觉得不需要接着运行, 返回 error
+	if err != nil && c.opts.onError(err) {
+		return 0, err
+	}
+
+	return n, nil
 }
 
-/* readLoop() blocking read from connection, deserialize bytes into message,
-then find corresponding handler, put it into channel */
-func (c *conn) readLoop() error {
-	data := make([]byte, c.opts.bufferSize)
+// readLoop() blocking read from connection
+// if blocked, will throw error
+func (c *Conn) readLoop(ctx context.Context) error {
+	data := make([]byte, c.opts.maxReadLength)
 
 	for {
 		select {
-		case <-c.ctx.Done():
-			return nil
+		case <-ctx.Done():
+			return ctx.Err()
 		default:
-			n, err := c.reader.Read(data)
+			_, err := c.read(data)
 			if err != nil {
-				if c.opts.onError != nil {
-					c.opts.onError(errors.Wrap(ErrNetRead, err.Error()))
-				}
 				return err
 			}
 
-			select {
-			case c.recvMsg <- data[0:n]:
-				data = data[:0]
-			default:
-				log.Println("recv chan blocked")
+			message, err := c.opts.codec.Decode(data)
+			if err != nil {
+				return err
+			}
+
+			err = c.opts.onMessage(message)
+			if err != nil {
+				return err
 			}
 		}
 	}
 }
 
-func (c *conn) handleLoop() error {
+// writeLoop() receive message from channel
+// serialize it into bytes, then blocking write into connection
+func (c *Conn) writeLoop(ctx context.Context) error {
 	for {
 		select {
-		case <-c.ctx.Done():
-			return nil
-		case data := <-c.recvMsg:
-			message, err := c.opts.codec.Decode(bytes.NewBuffer(data))
+		case <-ctx.Done():
+			return ctx.Err()
+		case data := <-c.sendMsg:
+			err := c.write(data)
 			if err != nil {
-				if c.opts.onError != nil {
-					c.opts.onError(errors.Wrap(ErrHandlerMsg, err.Error()))
-				}
 				return err
 			}
-
-			if c.opts.onMessage != nil {
-				c.opts.onMessage(message)
-			}
 		}
-
 	}
 }
 
-/* writeLoop() receive message from channel, serialize it into bytes,
-then blocking write into connection */
-func (c *conn) writeLoop() error {
-	for {
-		select {
-		case <-c.ctx.Done():
-			return nil
-		case msg := <-c.sendMsg:
-			data, err := c.opts.codec.Encode(msg)
-			if err != nil {
-				return err
-			}
+func (c *Conn) write(data []byte) error {
+	c.rawConn.SetWriteDeadline(time.Now().Add(c.heartbeat * 2))
 
-			if _, err = c.rawConn.Write(data); err != nil {
-				if c.opts.onError != nil {
-					c.opts.onError(errors.Wrap(ErrNetWrite, err.Error()))
-				}
+	_, err := c.rawConn.Write(data)
 
-				return err
-			}
-		}
+	// 如果错误处理方, 觉得不需要接着运行, 返回 error
+	if err != nil && c.opts.onError(err) {
+		return err
 	}
+
+	return nil
+}
+
+func (c *Conn) close() {
+	c.rawConn.Close()
 }
